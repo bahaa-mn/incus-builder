@@ -99,6 +99,13 @@ ask_inputs() {
     warn "Valeur invalide (1-$mem_gb)."
   done
 
+  # Compte dédié comme dans vps-setup (doc : coolify.io/docs/core/infrastructure/servers/non-root-user)
+  while :; do
+    ask COOLIFY_USER "Nom de l'utilisateur Coolify" "coolify"
+    [[ $COOLIFY_USER =~ ^[a-z_][a-z0-9_-]{0,31}$ && $COOLIFY_USER != root ]] && break
+    warn "Nom invalide (minuscules, chiffres, _ ou -, 32 caractères max, pas root)."
+  done
+
   COOLIFY_KEY=""
   echo "Dans Coolify : Keys & Tokens > Private Keys > New private key > Generate ED25519 (sans passphrase), copier la clé publique."
   while :; do
@@ -131,7 +138,8 @@ ask_inputs() {
   echo "  Limites   : $CPU CPU, $MEM Go de RAM"
   echo "  Réseau    : ACL $ACL sur le bridge Incus, IPv6 coupé sur le bridge"
   echo "              bloqués : ${PRIVATE_RANGES//,/ }"
-  echo "  Coolify   : $( [[ -n $COOLIFY_KEY ]] && echo "clé ajoutée pour root (SSH par clé uniquement)" || echo "clé à ajouter plus tard")"
+  echo "  Coolify   : utilisateur $COOLIFY_USER (sudo sans mot de passe, SSH par clé uniquement, root interdit)"
+  echo "              $( [[ -n $COOLIFY_KEY ]] && echo "clé ajoutée" || echo "clé à ajouter plus tard")"
   echo "  NetBird   : $( ((NETBIRD)) && echo "$NB_URL, hostname $CT" || echo non)"
   echo "  incus-admin : $( ((ADMIN_GROUP)) && echo "$SUDO_USER" || echo non)"
   echo "  Pas de veille : $( ((NO_SLEEP)) && echo oui || echo non)"
@@ -156,19 +164,73 @@ EOF
   systemctl restart systemd-logind
 }
 
+# "incus admin init --minimal" échoue quand il ne trouve pas seul de sous-réseau libre :
+# on choisit un /24 en 10.x qui ne chevauche aucune route de l'hôte
+init_incus() {
+  local net gw
+  gw=$(ip -4 route show default | awk '{print $3; exit}')
+  [[ -n $gw ]] || die "Pas de route par défaut sur l'hôte."
+  while :; do
+    net="10.$((RANDOM % 256)).$((RANDOM % 256))"
+    # Libre si l'hôte l'enverrait par sa route par défaut (aucune route plus précise, /8 compris)
+    ip -4 route get "$net.1" | grep -q " via $gw " && break
+  done
+  incus admin init --preseed <<EOF
+networks:
+- name: incusbr0
+  type: bridge
+  config:
+    ipv4.address: $net.1/24
+    ipv4.nat: "true"
+    ipv6.address: none
+storage_pools:
+- name: default
+  driver: dir
+profiles:
+- name: default
+  devices:
+    root: {path: /, pool: default, type: disk}
+    eth0: {name: eth0, network: incusbr0, type: nic}
+EOF
+}
+
+# Dépôt officiel Incus (Zabbly) : l'Incus 6.0.0 d'Ubuntu 24.04 ne laisse pas tourner
+# Docker depuis les correctifs de sécurité de runc (sysctl ... permission denied)
+ZABBLY_FPR=4EFC590696CB15B87C73A3AD82CC8797C838DCFD
+install_incus() {
+  local key=/etc/apt/keyrings/zabbly.asc fpr codename
+  if [[ ! -f /etc/apt/sources.list.d/zabbly-incus-stable.sources ]]; then
+    install -d -m 755 /etc/apt/keyrings
+    curl -fsSL --max-time 30 https://pkgs.zabbly.com/key.asc -o "$key.tmp"
+    fpr=$(gpg --show-keys --with-colons "$key.tmp" | awk -F: '/^fpr/ {print $10; exit}')
+    [[ $fpr == "$ZABBLY_FPR" ]] || { rm -f "$key.tmp"; die "Empreinte de la clé Zabbly inattendue : $fpr"; }
+    mv "$key.tmp" "$key"
+    codename=${VERSION_CODENAME:?}   # lu depuis /etc/os-release dans main()
+    cat >/etc/apt/sources.list.d/zabbly-incus-stable.sources <<EOF
+Enabled: yes
+Types: deb
+URIs: https://pkgs.zabbly.com/incus/stable
+Suites: $codename
+Components: main
+Architectures: $(dpkg --print-architecture)
+Signed-By: $key
+EOF
+  fi
+  apt-get update
+  # Installe, ou remplace la version Ubuntu déjà présente
+  apt-get install -y incus
+}
+
 step_incus() {
   info "Incus"
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
-  if ! command -v incus &>/dev/null; then
-    apt-get update
-    apt-get install -y incus
-  fi
+  install_incus
   incus --version
   (( ADMIN_GROUP )) && usermod -aG incus-admin "$SUDO_USER"
 
   BR=$(bridge_of_default_profile)
   if [[ -z $BR ]]; then
-    incus admin init --minimal
+    init_incus
     BR=$(bridge_of_default_profile)
   fi
   [[ -n $BR ]] || die "Pas de réseau sur le profil default d'Incus (incus profile show default)."
@@ -250,12 +312,12 @@ step_container() {
 # ---------------------------------------------------------------------------
 step_provision() {
   info "Docker et SSH dans $CT"
-  incus exec "$CT" --env COOLIFY_KEY="$COOLIFY_KEY" -- bash -s <<'EOF'
+  incus exec "$CT" --env COOLIFY_USER="$COOLIFY_USER" --env COOLIFY_KEY="$COOLIFY_KEY" -- bash -s <<'EOF'
 set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 apt-get update
 apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade
-apt-get install -y curl ca-certificates openssh-server unattended-upgrades iputils-ping
+apt-get install -y curl ca-certificates openssh-server sudo unattended-upgrades iputils-ping
 
 cat >/etc/apt/apt.conf.d/20auto-upgrades <<'CONF'
 APT::Periodic::Update-Package-Lists "1";
@@ -285,23 +347,42 @@ cat >/etc/cron.d/docker-prune <<'CONF'
 0 5 * * 0 root docker builder prune -af --filter until=168h >/dev/null 2>&1; docker image prune -af --filter until=168h >/dev/null 2>&1
 CONF
 
-# Root du conteneur non privilégié = utilisateur sans droits sur l'hôte : Coolify s'y connecte en root
-cat >/etc/ssh/sshd_config.d/00-hardening.conf <<'CONF'
-PermitRootLogin prohibit-password
+# Utilisateur Coolify, comme vps-setup : 'NP' = compte déverrouillé sans mot de passe
+# utilisable (un compte verrouillé refuse aussi les clés SSH)
+if ! id "$COOLIFY_USER" &>/dev/null; then
+  useradd --create-home --user-group --shell /bin/bash --password 'NP' "$COOLIFY_USER"
+elif [[ $(passwd -S "$COOLIFY_USER" | awk '{print $2}') == L ]]; then
+  usermod -p 'NP' "$COOLIFY_USER"
+fi
+home=$(getent passwd "$COOLIFY_USER" | cut -d: -f6)
+install -d -m 700 -o "$COOLIFY_USER" -g "$COOLIFY_USER" "$home/.ssh"
+ak=$home/.ssh/authorized_keys
+touch "$ak"
+if [[ -n $COOLIFY_KEY ]] && ! grep -qxF "$COOLIFY_KEY" "$ak"; then echo "$COOLIFY_KEY" >>"$ak"; fi
+chown "$COOLIFY_USER:$COOLIFY_USER" "$ak"
+chmod 600 "$ak"
+
+sudoers=/etc/sudoers.d/$COOLIFY_USER
+echo "$COOLIFY_USER ALL=(ALL) NOPASSWD: ALL" >"$sudoers.tmp"
+chmod 440 "$sudoers.tmp"
+visudo -cf "$sudoers.tmp" >/dev/null || { rm -f "$sudoers.tmp"; echo "Règle sudoers invalide" >&2; exit 1; }
+mv "$sudoers.tmp" "$sudoers"
+[[ $(su - "$COOLIFY_USER" -c 'sudo -n whoami') == root ]]
+
+mkdir -p /data/coolify
+chown -R "$COOLIFY_USER:$COOLIFY_USER" /data/coolify
+chmod -R o-rwx /data/coolify
+
+cat >/etc/ssh/sshd_config.d/00-hardening.conf <<CONF
+PermitRootLogin no
 PasswordAuthentication no
 PermitEmptyPasswords no
 KbdInteractiveAuthentication no
 MaxAuthTries 3
 LoginGraceTime 30
 X11Forwarding no
-AllowUsers root
+AllowUsers $COOLIFY_USER
 CONF
-install -d -m 700 /root/.ssh
-touch /root/.ssh/authorized_keys
-chmod 600 /root/.ssh/authorized_keys
-if [[ -n $COOLIFY_KEY ]] && ! grep -qxF "$COOLIFY_KEY" /root/.ssh/authorized_keys; then
-  echo "$COOLIFY_KEY" >>/root/.ssh/authorized_keys
-fi
 install -d -m 755 /run/sshd
 sshd -t
 systemctl enable ssh
@@ -325,6 +406,8 @@ step_netbird() {
   ct netbird status
 }
 
+coolify_user() { ct awk '$1 == "AllowUsers" {print $2}' /etc/ssh/sshd_config.d/00-hardening.conf 2>/dev/null || true; }
+
 netbird_ip() { ct netbird status 2>/dev/null | awk '/NetBird IP:/ {sub(/\/.*/, "", $3); print $3}'; }
 
 # ---------------------------------------------------------------------------
@@ -332,7 +415,7 @@ netbird_ip() { ct netbird status 2>/dev/null | awk '/NetBird IP:/ {sub(/\/.*/, "
 # ---------------------------------------------------------------------------
 step_check() {
   info "Vérifications"
-  local gw br_ip nb
+  local gw br_ip nb cu
   FAILED=0
   BR=${BR:-$(bridge_of_default_profile)}
   br_ip=$(incus network get "$BR" ipv4.address); br_ip=${br_ip%/*}
@@ -359,8 +442,11 @@ step_check() {
   fi
 
   if ct systemctl is-active --quiet ssh; then ok "SSH actif dans le conteneur"; else ko "SSH inactif dans le conteneur"; fi
-  if ! ct test -s /root/.ssh/authorized_keys; then
-    warn "Aucune clé Coolify : incus exec $CT -- bash -c 'cat >>/root/.ssh/authorized_keys' <<<'ssh-ed25519 AAAA...'"
+  cu=$(coolify_user)
+  if [[ -z $cu ]]; then
+    ko "Pas d'utilisateur Coolify dans AllowUsers (/etc/ssh/sshd_config.d/00-hardening.conf)"
+  elif ! ct test -s "/home/$cu/.ssh/authorized_keys"; then
+    warn "Aucune clé Coolify : incus exec $CT -- bash -c 'cat >>/home/$cu/.ssh/authorized_keys' <<<'ssh-ed25519 AAAA...'"
   fi
 
   if ct sh -c 'command -v netbird' &>/dev/null; then
@@ -383,7 +469,7 @@ summary() {
   echo "  - aucune route vers le LAN distribuée au groupe builder"
   echo
   echo "Dans Coolify : Servers > Add"
-  echo "  IP ${nb:-<IP NetBird du conteneur>}, port 22, utilisateur root, clé générée dans Coolify"
+  echo "  IP ${nb:-<IP NetBird du conteneur>}, port 22, utilisateur $(coolify_user), clé générée dans Coolify"
   echo "  cocher \"Use it as a build server\""
 }
 
