@@ -40,14 +40,24 @@ confirm() {
 extract_keys() { grep -oE '(ssh|ecdsa|sk)-[a-z0-9@.-]+ AAAA[A-Za-z0-9+/=]+( .*)?$' || true; }
 
 ACL=no-lan
-# Tout ce qui n'est pas internet : LAN, VLAN, NetBird/Tailscale (100.64/10), lien local.
-# L'IP de l'hôte sur le bridge est dans 10/8 : le conteneur ne joint pas non plus l'hôte.
+# Bridge dédié au builder : aucune autre instance ne le partage, et le bridge par défaut
+# de l'hôte (et ses éventuels autres conteneurs) n'est pas modifié
+BUILDER_BR=builderbr0
+# Tout ce qui n'est pas internet : LAN, VLAN, NetBird/Tailscale (100.64/10), lien local,
+# multicast et broadcast. Les adresses propres de l'hôte s'y ajoutent (host_addresses).
 # Incus garde ouverts DHCP et DNS vers le bridge, sinon le conteneur n'aurait pas de réseau.
-PRIVATE_RANGES=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,169.254.0.0/16
+PRIVATE_RANGES=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,169.254.0.0/16,224.0.0.0/4,255.255.255.255/32
 
 ct() { incus exec "$CT" -- "$@"; }
 
 bridge_of_default_profile() { incus profile device get default eth0 network 2>/dev/null || true; }
+
+# Réseau réellement utilisé par le conteneur (profil ou device propre)
+network_of_ct() { incus config show "$CT" --expanded | awk '/^  eth0:/ {f=1} f && /^    network:/ {print $2; exit}'; }
+
+# Toutes les adresses IPv4 de l'hôte en /32, séparées par des virgules : une IP publique
+# ou hors plages privées serait sinon joignable par la règle "allow 0.0.0.0/0"
+host_addresses() { ip -4 -o addr show | awk '$4 !~ /^127\./ {sub(/\/.*/, "", $4); printf "%s%s/32", sep, $4; sep = ","}'; }
 
 # ---------------------------------------------------------------------------
 # Questions
@@ -166,7 +176,7 @@ EOF
 
 # "incus admin init --minimal" échoue quand il ne trouve pas seul de sous-réseau libre :
 # on choisit un /24 en 10.x qui ne chevauche aucune route de l'hôte
-init_incus() {
+free_subnet() {
   local net gw
   gw=$(ip -4 route show default | awk '{print $3; exit}')
   [[ -n $gw ]] || die "Pas de route par défaut sur l'hôte."
@@ -175,6 +185,12 @@ init_incus() {
     # Libre si l'hôte l'enverrait par sa route par défaut (aucune route plus précise, /8 compris)
     ip -4 route get "$net.1" | grep -q " via $gw " && break
   done
+  echo "$net"
+}
+
+init_incus() {
+  local net
+  net=$(free_subnet)
   incus admin init --preseed <<EOF
 networks:
 - name: incusbr0
@@ -233,12 +249,13 @@ step_incus() {
   incus --version
   (( ADMIN_GROUP )) && usermod -aG incus-admin "$SUDO_USER"
 
-  BR=$(bridge_of_default_profile)
-  if [[ -z $BR ]]; then
+  if [[ -z $(bridge_of_default_profile) ]]; then
     init_incus
-    BR=$(bridge_of_default_profile)
   fi
-  [[ -n $BR ]] || die "Pas de réseau sur le profil default d'Incus (incus profile show default)."
+  BR=$BUILDER_BR
+  if ! incus network show "$BR" &>/dev/null; then
+    incus network create "$BR" ipv4.address="$(free_subnet).1/24" ipv4.nat=true ipv6.address=none
+  fi
 
   # Les ACL sur un bridge ne fonctionnent qu'avec le pare-feu nftables
   incus info | grep -q 'firewall: nftables' \
@@ -250,7 +267,7 @@ step_incus() {
 
 step_network() {
   info "Isolation réseau : ACL $ACL sur $BR"
-  local acls
+  local acls n others
   # Une seule famille d'adresses à filtrer
   incus network set "$BR" ipv6.address=none
 
@@ -260,7 +277,7 @@ step_network() {
 description: Bloque le réseau local et l'hôte, laisse sortir vers internet (incus-builder)
 egress:
 - action: reject
-  destination: $PRIVATE_RANGES
+  destination: $PRIVATE_RANGES,$(host_addresses)
   state: enabled
 - action: allow
   destination: 0.0.0.0/0
@@ -275,6 +292,14 @@ EOF
     incus network set "$BR" security.acls="$acls,$ACL"
   fi
 
+  # Anciennes versions : l'ACL était posée sur le bridge par défaut, on l'en retire
+  for n in $(incus network acl show "$ACL" | awk '/^used_by:/ {f=1; next} f && /^ *- / {sub(/.*\//, ""); print; next} {f=0}'); do
+    [[ $n == "$BR" ]] && continue
+    others=$(incus network get "$n" security.acls | tr ',' '\n' | { grep -vx "$ACL" || true; } | paste -sd, -)
+    if [[ -n $others ]]; then incus network set "$n" security.acls="$others"; else incus network unset "$n" security.acls; fi
+    warn "ACL $ACL retirée de $n (le builder a désormais son propre bridge $BR)."
+  done
+
   if ufw status 2>/dev/null | grep -q '^Status: active'; then
     info "UFW actif sur l'hôte : autorisation du bridge $BR"
     # Accès à l'hôte depuis le conteneur déjà limité par l'ACL (DHCP et DNS seulement)
@@ -286,8 +311,18 @@ EOF
 
 step_container() {
   info "Conteneur $CT"
+  local running=0
   if ! incus info "$CT" &>/dev/null; then
-    incus init images:ubuntu/24.04 "$CT"
+    incus init images:ubuntu/24.04 "$CT" --network "$BR"
+  elif [[ $(incus info "$CT" | awk '/^Status:/ {print $2}') == RUNNING ]]; then
+    running=1
+    # Le changement de réseau de la carte demande un conteneur arrêté
+    incus stop "$CT"
+  fi
+  if incus config device get "$CT" eth0 network &>/dev/null; then
+    incus config device set "$CT" eth0 network="$BR"
+  else
+    incus config device override "$CT" eth0 network="$BR"
   fi
   incus config set "$CT" \
     security.nesting=true \
@@ -299,11 +334,8 @@ step_container() {
   # NetBird crée son interface WireGuard via /dev/net/tun
   incus config device show "$CT" | grep -q '^tun:' \
     || incus config device add "$CT" tun unix-char path=/dev/net/tun
-  if [[ $(incus info "$CT" | awk '/^Status:/ {print $2}') == RUNNING ]]; then
-    incus restart "$CT"
-  else
-    incus start "$CT"
-  fi
+  incus start "$CT"
+  (( running )) && info "Conteneur $CT redémarré sur $BR"
 
   for _ in {1..30}; do
     ct getent hosts deb.debian.org &>/dev/null && return 0
@@ -411,19 +443,31 @@ step_netbird() {
   ct netbird status
 }
 
-coolify_user() { ct awk '$1 == "AllowUsers" {print $2}' /etc/ssh/sshd_config.d/00-hardening.conf 2>/dev/null || true; }
+# Valeurs lues dans le conteneur (moins fiable que l'hôte) : revalidées avant d'être
+# affichées ou insérées dans une commande à coller, sinon un conteneur compromis
+# pourrait y glisser des commandes ou des séquences d'échappement
+coolify_user() {
+  local u
+  u=$(ct awk '$1 == "AllowUsers" {print $2; exit}' /etc/ssh/sshd_config.d/00-hardening.conf 2>/dev/null || true)
+  if [[ $u =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then printf '%s' "$u"; fi
+  return 0
+}
 
-netbird_ip() { ct netbird status 2>/dev/null | awk '/NetBird IP:/ {sub(/\/.*/, "", $3); print $3}'; }
+netbird_ip() {
+  local ip
+  ip=$(ct netbird status 2>/dev/null | awk '/NetBird IP:/ {sub(/\/.*/, "", $3); print $3; exit}' || true)
+  if [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then printf '%s' "$ip"; fi
+  return 0
+}
 
 # ---------------------------------------------------------------------------
 # Vérifications
 # ---------------------------------------------------------------------------
 step_check() {
   info "Vérifications"
-  local gw br_ip nb cu
+  local gw addr nb cu
   FAILED=0
-  BR=${BR:-$(bridge_of_default_profile)}
-  br_ip=$(incus network get "$BR" ipv4.address); br_ip=${br_ip%/*}
+  BR=$(network_of_ct)
   gw=$(ip -4 route show default | awk '{print $3; exit}')
 
   if ct curl -fsS -o /dev/null --max-time 15 https://deb.debian.org; then ok "Internet joignable"; else ko "Internet injoignable"; fi
@@ -434,11 +478,15 @@ step_check() {
     warn "Passerelle $gw ne répond pas au ping depuis l'hôte : test LAN impossible."
   fi
 
-  if ct timeout 3 bash -c "</dev/tcp/$br_ip/22" &>/dev/null; then
-    ko "SSH de l'hôte ($br_ip:22) joignable depuis le conteneur"
-  else
-    ok "Hôte ($br_ip) injoignable depuis le conteneur"
-  fi
+  # Toutes les adresses de l'hôte, y compris celles apparues après l'installation
+  for addr in $(host_addresses | tr ',' ' '); do
+    addr=${addr%/32}
+    if ct timeout 3 bash -c "</dev/tcp/$addr/22" &>/dev/null; then
+      ko "SSH de l'hôte ($addr:22) joignable depuis le conteneur : relancer le script pour mettre à jour l'ACL"
+    else
+      ok "Hôte ($addr) injoignable depuis le conteneur"
+    fi
+  done
 
   if ct docker run --rm hello-world &>/dev/null; then
     ok "Docker fonctionne ($(ct docker info -f '{{.Driver}}'))"
@@ -469,6 +517,7 @@ summary() {
   echo "Shell dans le conteneur : sudo incus exec $CT -- bash"
   echo
   echo "Dans NetBird :"
+  echo "  - supprimer la politique Default (tous vers tous), sinon le builder joint tous les pairs"
   echo "  - politique coolify -> builder, TCP 22, non bidirectionnelle"
   echo "  - politique builder -> coolify, port du registry"
   echo "  - aucune route vers le LAN distribuée au groupe builder"

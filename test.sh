@@ -13,11 +13,11 @@ expect_ok() { local d=$1; shift; if "$@" &>/dev/null; then pass "$d"; else fail 
 expect_ko() { local d=$1; shift; if "$@" &>/dev/null; then fail "$d"; else pass "$d"; fi; }
 tcp() { timeout 4 bash -c "</dev/tcp/$1/$2"; }
 
-BR=$(incus profile device get default eth0 network)
+BR=$(incus config show "$CT" --expanded | awk '/^  eth0:/ {f=1} f && /^    network:/ {print $2; exit}')
 BR_IP=$(incus network get "$BR" ipv4.address); BR_IP=${BR_IP%/*}
 HOST_IP=$(ip -4 route get 1.1.1.1 | awk '{for (i=1; i<NF; i++) if ($i=="src") {print $(i+1); exit}}')
 GW=$(ip -4 route show default | awk '{print $3; exit}')
-CT_IP=$(incus list "^$CT\$" -c 4 -f csv | grep -oE '10\.[0-9.]+ \(eth0\)' | cut -d' ' -f1)
+CT_IP=$(incus list "^$CT\$" -c 4 -f csv | grep -oE '[0-9.]+ \(eth0\)' | cut -d' ' -f1)
 echo "bridge=$BR_IP host=$HOST_IP gw=$GW ct=$CT_IP"
 
 # Faux services sur l'hôte : un sur chaque plage privée (LAN, hôte, NetBird, 172.16/12)
@@ -28,9 +28,9 @@ ip addr add 192.168.77.1/32 dev dummy-test 2>/dev/null
 ip link set dummy-test up
 # Dossier vide servi : rien à lire pour un autre appareil du LAN pendant le test
 EMPTY=$(mktemp -d)
-python3 -m http.server 8099 --bind 0.0.0.0 --directory "$EMPTY" &>/dev/null &
+python3 -I -m http.server 8099 --bind 0.0.0.0 --directory "$EMPTY" &>/dev/null &
 WEB=$!
-python3 - <<'EOF' &
+python3 -I - <<'EOF' &
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("0.0.0.0", 9099))
 while True:
@@ -56,6 +56,9 @@ echo "== Conteneur -> réseau local et hôte (doivent échouer)"
 expect_ko "ping passerelle $GW" ct ping -c1 -W2 "$GW"
 for ip in "$HOST_IP" "$BR_IP" 100.80.0.1 172.20.0.1 192.168.77.1; do expect_ko "TCP $ip:8099" ct timeout 4 bash -c "</dev/tcp/$ip/8099"; done
 expect_ko "SSH de l'hôte $BR_IP:22" ct timeout 4 bash -c "</dev/tcp/$BR_IP/22"
+for ip in $(ip -4 -o addr show | awk '$4 !~ /^127\./ {sub(/\/.*/, "", $4); print $4}'); do
+  expect_ko "adresse de l'hôte : TCP $ip:8099" ct timeout 4 bash -c "</dev/tcp/$ip/8099"
+done
 expect_ko "UDP $HOST_IP:9099" udp "$HOST_IP" 9099
 expect_ko "UDP 100.80.0.1:9099" udp 100.80.0.1 9099
 expect_ko "DNS UDP vers la passerelle $GW:53" ct python3 -c "import socket; s=socket.socket(2,2); s.settimeout(3); s.sendto(bytes.fromhex('abcd01000001000000000000076578616d706c6503636f6d0000010001'),('$GW',53)); s.recv(512)"
@@ -105,6 +108,7 @@ expect_ok "ACL $BR = no-lan" bash -c "[[ \$(incus network get $BR security.acls)
 expect_ok "conteneur non privilégié" bash -c "[[ \$(incus config get $CT security.privileged) != true ]]"
 expect_ok "root du conteneur mappé sur un UID non root de l'hôte" bash -c "ps -o uid= -p \$(incus info $CT | awk '/^PID:/{print \$2}') | grep -qv '^ *0$'"
 expect_ok "démarrage automatique" bash -c "[[ \$(incus config get $CT boot.autostart) == true ]]"
+expect_ok "seul conteneur sur le bridge $BR" bash -c "[[ \$(incus network show $BR | grep -c '^ *- /1.0/instances/') == 1 ]]"
 
 echo
 echo "RESULTAT : $PASS PASS, $FAIL FAIL"

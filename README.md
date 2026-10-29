@@ -35,9 +35,11 @@ Le script pose ses questions au début, affiche un récapitulatif, fait tout, pu
 
 **Hôte**
 - installe Incus depuis le dépôt officiel [Zabbly](https://github.com/zabbly/incus) (empreinte de la clé vérifiée) : l'Incus 6.0.0 d'Ubuntu 24.04 ne fait plus tourner Docker depuis les correctifs de sécurité de runc (`open sysctl net.ipv4.ip_unprivileged_port_start ... permission denied`). Une version Ubuntu déjà installée est remplacée
-- l'initialise s'il ne l'est pas déjà, avec un bridge en `10.x.y.0/24` qui ne chevauche aucune route de l'hôte, sans IPv6 (une seule famille d'adresses à filtrer)
-- pose l'ACL `no-lan` sur le bridge : rejet de `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10` (NetBird, Tailscale) et `169.254.0.0/16`, tout le reste autorisé vers internet. L'IP de l'hôte sur le bridge est dans ces plages : le conteneur ne joint pas l'hôte. Incus laisse passer DHCP et DNS vers le bridge
+- l'initialise s'il ne l'est pas déjà (bridge par défaut `incusbr0` en `10.x.y.0/24` qui ne chevauche aucune route de l'hôte)
+- crée un bridge dédié au builder, `builderbr0`, en `10.x.y.0/24` libre et sans IPv6 : aucune autre instance ne le partage, et le bridge par défaut de l'hôte (et ses autres conteneurs) n'est pas modifié
+- pose l'ACL `no-lan` sur `builderbr0` : rejet de `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10` (NetBird, Tailscale), `169.254.0.0/16`, du multicast et du broadcast, **et de toutes les adresses IPv4 de l'hôte** (une IP publique de l'hôte serait sinon joignable), tout le reste autorisé vers internet. Incus laisse passer DHCP et DNS vers le bridge
 - si UFW est actif : autorise le trafic du bridge (le filtrage reste fait par l'ACL)
+- si l'hôte change d'adresse (nouvelle IP publique), relancer le script pour mettre l'ACL à jour : `setup.sh check` teste toutes les adresses actuelles de l'hôte et signale celles qui seraient joignables
 
 **Conteneur** (Ubuntu 24.04)
 - `security.nesting` pour Docker, `/dev/net/tun` pour NetBird, limites CPU et mémoire, démarrage automatique
@@ -47,7 +49,7 @@ Le script pose ses questions au début, affiche un récapitulatif, fait tout, pu
 - SSH par clé uniquement, root interdit, seul l'utilisateur Coolify autorisé (`AllowUsers`)
 - NetBird : `netbird up` avec l'URL et la clé de setup, hostname = nom du conteneur
 
-Relancer le script sur un conteneur existant le réutilise : limites, ACL et configuration sont réappliquées.
+Relancer le script sur un conteneur existant le réutilise : limites, ACL et configuration sont réappliquées. Un conteneur installé par une version précédente (sur le bridge par défaut) est déplacé sur `builderbr0` et l'ACL est retirée du bridge par défaut.
 
 ## Étapes seules
 
@@ -64,19 +66,19 @@ Vérifications : internet joignable, box injoignable depuis le conteneur, SSH de
 sudo bash test.sh [conteneur]
 ```
 
-43 tests, chacun avec un témoin depuis l'hôte pour qu'un échec attendu ne soit pas dû à un service absent :
+50 tests (plus un par adresse supplémentaire de l'hôte), chacun avec un témoin depuis l'hôte pour qu'un échec attendu ne soit pas dû à un service absent :
 
 - internet : HTTPS, DNS par le bridge, DNS UDP direct
-- refusés depuis le conteneur, en TCP, UDP et ping : passerelle, IP de l'hôte (LAN et bridge), SSH de l'hôte, une adresse NetBird (100.64/10), 172.16/12, un autre sous-réseau 192.168, DNS de la box, IPv6
+- refusés depuis le conteneur, en TCP, UDP et ping : passerelle, IP de l'hôte (LAN et bridge), SSH de l'hôte, chacune des adresses de l'hôte, une adresse NetBird (100.64/10), 172.16/12, un autre sous-réseau 192.168, DNS de la box, IPv6
 - la même chose depuis un conteneur Docker lancé dans le builder (c'est là que tournent les builds), plus un `docker build` complet
 - entrée refusée : l'hôte ne joint pas le SSH du conteneur
 - SSH : clé Coolify acceptée avec sudo et Docker, root refusé avec la même clé, autre utilisateur refusé, mot de passe refusé
 - NetBird : `/dev/net/tun`, création d'interfaces TUN et WireGuard
-- conteneur non privilégié (root du conteneur = UID non root sur l'hôte), démarrage automatique
+- conteneur non privilégié (root du conteneur = UID non root sur l'hôte), démarrage automatique, seul conteneur sur son bridge
 
 Le test crée le temps de son exécution une interface factice, deux petits serveurs, une clé SSH et un utilisateur temporaires, et retire tout à la fin.
 
-Validé sur une VM Ubuntu 24.04 neuve (arm64), installation complète puis relance du script sur le conteneur existant : 43/43.
+Validé sur une VM Ubuntu 24.04 neuve (arm64), installation complète puis relance du script sur le conteneur existant : 50/50. Validé aussi en mise à jour depuis la version précédente, avec une adresse non privée sur l'hôte et un autre conteneur sur le bridge par défaut : 51/51, l'hôte et l'autre conteneur sont injoignables.
 
 ## Après le script
 
