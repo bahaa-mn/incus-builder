@@ -26,7 +26,9 @@ ip addr add 100.80.0.1/32 dev dummy-test 2>/dev/null
 ip addr add 172.20.0.1/32 dev dummy-test 2>/dev/null
 ip addr add 192.168.77.1/32 dev dummy-test 2>/dev/null
 ip link set dummy-test up
-python3 -m http.server 8099 --bind 0.0.0.0 &>/dev/null &
+# Dossier vide servi : rien à lire pour un autre appareil du LAN pendant le test
+EMPTY=$(mktemp -d)
+python3 -m http.server 8099 --bind 0.0.0.0 --directory "$EMPTY" &>/dev/null &
 WEB=$!
 python3 - <<'EOF' &
 import socket
@@ -36,7 +38,7 @@ while True:
 EOF
 UDP=$!
 sleep 1
-trap 'kill $WEB $UDP 2>/dev/null; ip link del dummy-test 2>/dev/null; ct sed -i "/ incus-builder-test\$/d" "/home/${U:-x}/.ssh/authorized_keys" 2>/dev/null' EXIT
+trap 'kill $WEB $UDP 2>/dev/null; rm -rf "$EMPTY"; ip link del dummy-test 2>/dev/null; ct sed -i "/ incus-builder-test\$/d" "/home/${U:-x}/.ssh/authorized_keys" 2>/dev/null' EXIT
 udp() { ct python3 -c "import socket,sys; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(3); s.sendto(b'ping',('$1',$2)); sys.exit(0 if s.recv(10)==b'pong' else 1)"; }
 
 echo "== Témoins : les services répondent depuis l'hôte"

@@ -198,13 +198,18 @@ EOF
 # Docker depuis les correctifs de sécurité de runc (sysctl ... permission denied)
 ZABBLY_FPR=4EFC590696CB15B87C73A3AD82CC8797C838DCFD
 install_incus() {
-  local key=/etc/apt/keyrings/zabbly.asc fpr codename
+  local key=/etc/apt/keyrings/zabbly.asc gh codename
   if [[ ! -f /etc/apt/sources.list.d/zabbly-incus-stable.sources ]]; then
     install -d -m 755 /etc/apt/keyrings
-    curl -fsSL --max-time 30 https://pkgs.zabbly.com/key.asc -o "$key.tmp"
-    fpr=$(gpg --show-keys --with-colons "$key.tmp" | awk -F: '/^fpr/ {print $10; exit}')
-    [[ $fpr == "$ZABBLY_FPR" ]] || { rm -f "$key.tmp"; die "Empreinte de la clé Zabbly inattendue : $fpr"; }
-    mv "$key.tmp" "$key"
+    gh=$(mktemp -d)
+    curl -fsSL --max-time 30 https://pkgs.zabbly.com/key.asc -o "$gh/key.asc"
+    # Seule la clé épinglée est gardée : une clé en plus dans le fichier ne serait pas de confiance pour apt
+    gpg --homedir "$gh" --quiet --import "$gh/key.asc" 2>/dev/null
+    gpg --homedir "$gh" --armor --export "$ZABBLY_FPR" >"$gh/pinned.asc"
+    [[ -s $gh/pinned.asc ]] || { rm -rf "$gh"; die "Clé Zabbly $ZABBLY_FPR absente du fichier téléchargé."; }
+    mv "$gh/pinned.asc" "$key"
+    chmod 644 "$key"
+    rm -rf "$gh"
     codename=${VERSION_CODENAME:?}   # lu depuis /etc/os-release dans main()
     cat >/etc/apt/sources.list.d/zabbly-incus-stable.sources <<EOF
 Enabled: yes
