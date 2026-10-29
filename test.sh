@@ -102,6 +102,10 @@ echo "== Prérequis NetBird dans le conteneur"
 expect_ok "/dev/net/tun présent" ct test -c /dev/net/tun
 expect_ok "création d'une interface TUN" ct bash -c 'ip tuntap add dev tuntest mode tun && ip link del tuntest'
 expect_ok "création d'une interface WireGuard noyau" ct bash -c 'ip link add wgtest type wireguard && ip link del wgtest'
+if ct sh -c 'command -v netbird' &>/dev/null; then
+  expect_ok "filtre wt0 chargé" ct nft list table inet builder_wt0
+  expect_ok "filtre wt0 rechargé au démarrage" ct systemctl is-enabled --quiet builder-wt0
+fi
 
 echo "== Hôte"
 expect_ok "ACL $BR = no-lan" bash -c "[[ \$(incus network get $BR security.acls) == *no-lan* ]]"

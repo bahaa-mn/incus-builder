@@ -57,6 +57,12 @@ network_of_ct() { incus config show "$CT" --expanded | awk '/^  eth0:/ {f=1} f &
 
 # Toutes les adresses IPv4 de l'hôte en /32, séparées par des virgules : une IP publique
 # ou hors plages privées serait sinon joignable par la règle "allow 0.0.0.0/0"
+valid_ipv4() {
+  local IFS=. o
+  [[ $1 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  for o in $1; do (( 10#$o <= 255 )) || return 1; done
+}
+
 host_addresses() { ip -4 -o addr show | awk '$4 !~ /^127\./ {sub(/\/.*/, "", $4); printf "%s%s/32", sep, $4; sep = ","}'; }
 
 # ---------------------------------------------------------------------------
@@ -83,6 +89,12 @@ ask_netbird() {
     read -rsp "Clé de setup NetBird (masquée) : " NB_KEY </dev/tty; echo
     [[ $NB_KEY =~ ^[A-Za-z0-9-]{20,}$ ]] && break
     warn "Clé invalide."
+  done
+  # Seul pair joignable par le tunnel : filtre wt0 dans le conteneur, en plus des politiques NetBird
+  while :; do
+    ask NB_COOLIFY_IP "IP NetBird du serveur Coolify (NetBird > Peers, ex: 100.92.10.4)"
+    valid_ipv4 "$NB_COOLIFY_IP" && break
+    warn "IP invalide."
   done
 }
 
@@ -150,7 +162,7 @@ ask_inputs() {
   echo "              bloqués : ${PRIVATE_RANGES//,/ }"
   echo "  Coolify   : utilisateur $COOLIFY_USER (sudo sans mot de passe, SSH par clé uniquement, root interdit)"
   echo "              $( [[ -n $COOLIFY_KEY ]] && echo "clé ajoutée" || echo "clé à ajouter plus tard")"
-  echo "  NetBird   : $( ((NETBIRD)) && echo "$NB_URL, hostname $CT" || echo non)"
+  echo "  NetBird   : $( ((NETBIRD)) && echo "$NB_URL, hostname $CT, tunnel limité à $NB_COOLIFY_IP" || echo non)"
   echo "  incus-admin : $( ((ADMIN_GROUP)) && echo "$SUDO_USER" || echo non)"
   echo "  Pas de veille : $( ((NO_SLEEP)) && echo oui || echo non)"
   confirm "Lancer la configuration ?" o || die "Annulé."
@@ -386,10 +398,24 @@ CONF
 
 # Utilisateur Coolify, comme vps-setup : 'NP' = compte déverrouillé sans mot de passe
 # utilisable (un compte verrouillé refuse aussi les clés SSH)
+# Un compte existant (système ou autre) n'est repris que s'il vient de ce script :
+# il recevrait sinon sudo sans mot de passe et la clé de Coolify
+marker="Coolify (incus-builder)"
+old=$(awk '$1 == "AllowUsers" {print $2; exit}' /etc/ssh/sshd_config.d/00-hardening.conf 2>/dev/null || true)
 if ! id "$COOLIFY_USER" &>/dev/null; then
-  useradd --create-home --user-group --shell /bin/bash --password 'NP' "$COOLIFY_USER"
+  useradd --create-home --user-group --shell /bin/bash --password 'NP' --comment "$marker" "$COOLIFY_USER"
+elif [[ $COOLIFY_USER != "$old" && $(getent passwd "$COOLIFY_USER" | cut -d: -f5) != "$marker" ]]; then
+  echo "Le compte $COOLIFY_USER existe déjà dans le conteneur sans venir de ce script : choisir un autre nom." >&2
+  exit 1
 elif [[ $(passwd -S "$COOLIFY_USER" | awk '{print $2}') == L ]]; then
   usermod -p 'NP' "$COOLIFY_USER"
+fi
+# Ancien compte Coolify repris : lever l'expiration posée lors d'un changement de nom
+chage -E -1 "$COOLIFY_USER"
+# Changement de nom : l'ancien compte perd sudo et ne peut plus se connecter
+if [[ -n $old && $old != "$COOLIFY_USER" && $old != root ]] && id "$old" &>/dev/null; then
+  rm -f "/etc/sudoers.d/$old"
+  usermod -L -e 1 "$old"
 fi
 home=$(getent passwd "$COOLIFY_USER" | cut -d: -f6)
 install -d -m 700 -o "$COOLIFY_USER" -g "$COOLIFY_USER" "$home/.ssh"
@@ -427,18 +453,86 @@ systemctl restart ssh
 EOF
 }
 
+# Dépôt apt de NetBird avec clé épinglée, comme Zabbly : pas de script d'installation exécuté
+NETBIRD_FPR=EFE37DF047DF7CCDF1FC54FA83F79AD029778355
 step_netbird() {
   info "NetBird dans $CT"
   # Clé lue sur stdin : elle n'apparaît ni dans la liste des processus de l'hôte ni dans l'historique
-  incus exec "$CT" --env NB_MANAGEMENT_URL="$NB_URL" --env NB_HOSTNAME="$CT" -- bash -c '
+  incus exec "$CT" --env NB_MANAGEMENT_URL="$NB_URL" --env NB_HOSTNAME="$CT" \
+    --env NB_COOLIFY_IP="$NB_COOLIFY_IP" --env NETBIRD_FPR="$NETBIRD_FPR" -- bash -c '
     set -Eeuo pipefail
-    read -r NB_SETUP_KEY; export NB_SETUP_KEY
-    if ! command -v netbird &>/dev/null; then
-      curl -fsSL --max-time 60 https://pkgs.netbird.io/install.sh -o /tmp/netbird-install.sh
-      sh /tmp/netbird-install.sh
-      rm -f /tmp/netbird-install.sh
-    fi
-    netbird up --management-url "$NB_MANAGEMENT_URL" --hostname "$NB_HOSTNAME"
+    export DEBIAN_FRONTEND=noninteractive
+    read -r key
+    # Source posée par une ancienne version (install.sh, clé non épinglée) : remplacée
+    rm -f /etc/apt/sources.list.d/netbird.list /usr/share/keyrings/netbird-archive-keyring.gpg
+    apt-get update
+    apt-get install -y gnupg nftables
+    gh=$(mktemp -d)
+    curl -fsSL --max-time 30 https://pkgs.netbird.io/debian/public.key -o "$gh/key.asc"
+    gpg --homedir "$gh" --quiet --import "$gh/key.asc" 2>/dev/null
+    gpg --homedir "$gh" --armor --export "$NETBIRD_FPR" >"$gh/pinned.asc"
+    [[ -s $gh/pinned.asc ]] || { echo "Clé NetBird $NETBIRD_FPR absente du fichier téléchargé" >&2; exit 1; }
+    install -d -m 755 /etc/apt/keyrings
+    install -m 644 "$gh/pinned.asc" /etc/apt/keyrings/netbird.asc
+    rm -rf "$gh"
+    cat >/etc/apt/sources.list.d/netbird.sources <<CONF
+Types: deb
+URIs: https://pkgs.netbird.io/debian
+Suites: stable
+Components: main
+Signed-By: /etc/apt/keyrings/netbird.asc
+CONF
+    apt-get update
+    apt-get install -y netbird
+    # Le paquet ne pose pas le service, contrairement à install.sh
+    systemctl is-enabled --quiet netbird 2>/dev/null || netbird service install
+    systemctl is-active --quiet netbird || netbird service start
+
+    # Tunnel wt0 : entrée limitée au SSH de Coolify, sortie limitée à Coolify (conteneur et builds Docker)
+    cat >/etc/builder-wt0.nft <<CONF
+table inet builder_wt0
+delete table inet builder_wt0
+table inet builder_wt0 {
+  chain input {
+    type filter hook input priority filter; policy accept;
+    iifname "wt0" ct state established,related accept
+    iifname "wt0" ip saddr $NB_COOLIFY_IP tcp dport 22 accept
+    iifname "wt0" ip saddr $NB_COOLIFY_IP icmp type echo-request accept
+    iifname "wt0" drop
+  }
+  chain forward {
+    type filter hook forward priority filter; policy accept;
+    iifname "wt0" ct state established,related accept
+    iifname "wt0" drop
+    oifname "wt0" ip daddr $NB_COOLIFY_IP accept
+    oifname "wt0" drop
+  }
+  chain output {
+    type filter hook output priority filter; policy accept;
+    oifname "wt0" ct state established,related accept
+    oifname "wt0" ip daddr $NB_COOLIFY_IP accept
+    oifname "wt0" drop
+  }
+}
+CONF
+    nft -c -f /etc/builder-wt0.nft
+    cat >/etc/systemd/system/builder-wt0.service <<CONF
+[Unit]
+Description=Filtre du tunnel NetBird (wt0)
+Before=netbird.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/builder-wt0.nft
+[Install]
+WantedBy=multi-user.target
+CONF
+    systemctl daemon-reload
+    systemctl enable builder-wt0.service
+    systemctl restart builder-wt0.service
+
+    # Clé visible uniquement par netbird up, pas par apt ni ses scripts
+    NB_SETUP_KEY=$key netbird up --management-url "$NB_MANAGEMENT_URL" --hostname "$NB_HOSTNAME"
   ' <<<"$NB_KEY"
   ct netbird status
 }
@@ -505,6 +599,7 @@ step_check() {
   if ct sh -c 'command -v netbird' &>/dev/null; then
     nb=$(netbird_ip)
     if ct netbird status | grep -q 'Management: Connected'; then ok "NetBird connecté (${nb:-IP inconnue})"; else ko "NetBird non connecté : incus exec $CT -- netbird status"; fi
+    if ct nft list table inet builder_wt0 &>/dev/null; then ok "Filtre du tunnel wt0 en place"; else ko "Filtre wt0 absent : sudo bash setup.sh netbird"; fi
   fi
   return 0
 }
