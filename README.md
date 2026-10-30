@@ -12,13 +12,16 @@ VPS Coolify  <── NetBird (sortant, chiffré) ──>  hôte Ubuntu
 
 ## Utilisation
 
-Le dépôt est privé : copier le script sur l'hôte, puis le lancer en root.
+Sur l'hôte, avec un utilisateur sudo :
 
 ```bash
-gh api repos/bahaa-mn/incus-builder/contents/setup.sh -H 'Accept: application/vnd.github.raw' > setup.sh
-# ou depuis votre machine : scp setup.sh <user>@<hote>:
-sudo bash setup.sh
+curl -fsSLO https://github.com/bahaa-mn/incus-builder/releases/download/v1.0.0/setup.sh
+echo "a40bb47f35838d064a6a80f8b45c489d665014d34075b649fd6a1d9a22b2a725  setup.sh" | sha256sum -c && sudo bash setup.sh
 ```
+
+L'URL pointe vers une [release](https://github.com/bahaa-mn/incus-builder/releases) immuable : le fichier d'une version publiée ne peut plus être modifié, contrairement à la branche `main`. Le script reste sur le disque (pas de `curl | bash`) : `setup.sh netbird` et `setup.sh check` le relancent plus tard.
+
+Ou, avec la CLI GitHub, via l'attestation de la release : `gh release verify-asset v1.0.0 setup.sh -R bahaa-mn/incus-builder`
 
 Le script pose ses questions au début, affiche un récapitulatif, fait tout, puis lance les vérifications.
 
@@ -65,7 +68,8 @@ Vérifications : internet joignable, box injoignable depuis le conteneur, SSH de
 ## Tests complets
 
 ```bash
-sudo bash test.sh [conteneur]
+curl -fsSLO https://github.com/bahaa-mn/incus-builder/releases/download/v1.0.0/test.sh
+echo "6a411d7bfd0ee5209e185b39c9c65af9719729ba254be8c44f224e67d7578f84  test.sh" | sha256sum -c && sudo bash test.sh [conteneur]
 ```
 
 50 tests (plus un par adresse supplémentaire de l'hôte, et deux si NetBird est installé), chacun avec un témoin depuis l'hôte pour qu'un échec attendu ne soit pas dû à un service absent :

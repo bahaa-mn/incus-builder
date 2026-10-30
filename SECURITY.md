@@ -12,6 +12,7 @@ Le code des builds (Dockerfile, dépendances téléchargées) est considéré co
 | Le réseau local | ACL `no-lan` : plages privées, multicast, broadcast, **toutes les adresses de l'hôte** et les réseaux connectés ou routés par l'hôte rejetés | `test.sh`, `setup.sh check` |
 | Les autres conteneurs de l'hôte | bridge dédié `builderbr0`, aucune autre instance dessus | `test.sh` |
 | Les autres pairs NetBird, les routes NetBird et les autres services de Coolify | filtre nftables sur `wt0` dans le conteneur : entrée limitée au SSH de Coolify, sortie limitée au port du registry de Coolify ; NetBird ne démarre pas sans ce filtre | `test.sh`, `setup.sh check` |
+| Les scripts téléchargés | releases immuables, SHA256 dans le README et attestation GitHub (`gh release verify-asset`) | `sha256sum -c` |
 | Le shell root de l'opérateur | les valeurs lues dans le conteneur sont revalidées, et toute sortie du conteneur affichée est débarrassée des caractères de contrôle (setup.sh et test.sh) | relecture de code, harnais |
 
 Les paquets Incus (Zabbly) et NetBird viennent de leurs dépôts apt, avec une clé dont l'empreinte est inscrite dans le script.
@@ -31,6 +32,7 @@ Le script ne peut pas vérifier ces points : ils dépendent de comptes et de ré
 Le filtre `wt0` du conteneur bloque déjà les autres pairs. Les politiques NetBird sont la seconde barrière, et la seule qui protège si le conteneur est compromis en root (il peut retirer son propre filtre).
 
 **Hôte**
+- [ ] lancer `setup.sh` et `test.sh` depuis une release (URL du README), vérifiés par SHA256 ou `gh release verify-asset`, pas depuis `main`
 - [ ] durcir l'hôte lui-même (SSH, pare-feu, mises à jour) : voir [vps-setup](https://github.com/bahaa-mn/vps-setup)
 - [ ] après un changement d'adresse ou de routes de l'hôte (nouvelle IP publique, nouvelle interface, nouveau VPN), relancer `sudo bash setup.sh` : l'ACL contient les adresses et les routes présentes lors de l'installation. `setup.sh check` signale une adresse de l'hôte joignable
 - [ ] si l'IP NetBird ou le port du registry de Coolify change, relancer `sudo bash setup.sh netbird`
