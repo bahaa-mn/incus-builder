@@ -63,7 +63,28 @@ valid_ipv4() {
   for o in $1; do (( 10#$o <= 255 )) || return 1; done
 }
 
+valid_ports() {
+  local IFS=, p
+  [[ $1 =~ ^[0-9]{1,5}(,[0-9]{1,5})*$ ]] || return 1
+  for p in $1; do (( 10#$p >= 1 && 10#$p <= 65535 )) || return 1; done
+}
+
 host_addresses() { ip -4 -o addr show | awk '$4 !~ /^127\./ {sub(/\/.*/, "", $4); printf "%s%s/32", sep, $4; sep = ","}'; }
+
+# Préfixes connectés ou routés par l'hôte (LAN en adresses publiques, routes VPN...), précédés
+# d'une virgule : hors plages privées, ils seraient sinon joignables. Les routes plus larges
+# que /8 (VPN plein tunnel en 0/1 + 128/1) et celles qui passent par la passerelle par défaut
+# (c'est internet) sont ignorées : les rejeter couperait internet.
+host_routes() {
+  local gw
+  gw=$(ip -4 route show default | awk '{print $3; exit}')
+  ip -4 route show table all type unicast | awk -v gw="$gw" '$1 != "default" && !(gw != "" && $0 ~ (" via " gw " ")) {
+    p = $1; if (p !~ /\//) p = p "/32"; split(p, a, "/"); if (a[2] + 0 >= 8 && !seen[p]++) printf ",%s", p }'
+}
+
+# Sortie du conteneur sans caractères de contrôle (ESC, CR, BEL...) : un conteneur compromis
+# ne peut ni réécrire l'affichage ni piloter le terminal de l'opérateur
+sanitize() { LC_ALL=C tr -d '\000-\010\013-\037\177'; }
 
 # ---------------------------------------------------------------------------
 # Questions
@@ -95,6 +116,12 @@ ask_netbird() {
     ask NB_COOLIFY_IP "IP NetBird du serveur Coolify (NetBird > Peers, ex: 100.92.10.4)"
     valid_ipv4 "$NB_COOLIFY_IP" && break
     warn "IP invalide."
+  done
+  # Seuls ports de Coolify joignables par le tunnel (en plus du SSH entrant de Coolify)
+  while :; do
+    ask NB_REGISTRY_PORTS "Port(s) du registry sur Coolify par NetBird, séparés par des virgules" "5000"
+    valid_ports "$NB_REGISTRY_PORTS" && break
+    warn "Ports invalides (1-65535, ex: 5000 ou 443,5000)."
   done
 }
 
@@ -162,7 +189,7 @@ ask_inputs() {
   echo "              bloqués : ${PRIVATE_RANGES//,/ }"
   echo "  Coolify   : utilisateur $COOLIFY_USER (sudo sans mot de passe, SSH par clé uniquement, root interdit)"
   echo "              $( [[ -n $COOLIFY_KEY ]] && echo "clé ajoutée" || echo "clé à ajouter plus tard")"
-  echo "  NetBird   : $( ((NETBIRD)) && echo "$NB_URL, hostname $CT, tunnel limité à $NB_COOLIFY_IP" || echo non)"
+  echo "  NetBird   : $( ((NETBIRD)) && echo "$NB_URL, hostname $CT, tunnel limité à $NB_COOLIFY_IP (ports $NB_REGISTRY_PORTS)" || echo non)"
   echo "  incus-admin : $( ((ADMIN_GROUP)) && echo "$SUDO_USER" || echo non)"
   echo "  Pas de veille : $( ((NO_SLEEP)) && echo oui || echo non)"
   confirm "Lancer la configuration ?" o || die "Annulé."
@@ -289,7 +316,7 @@ step_network() {
 description: Bloque le réseau local et l'hôte, laisse sortir vers internet (incus-builder)
 egress:
 - action: reject
-  destination: $PRIVATE_RANGES,$(host_addresses)
+  destination: $PRIVATE_RANGES,$(host_addresses)$(host_routes)
   state: enabled
 - action: allow
   destination: 0.0.0.0/0
@@ -303,14 +330,6 @@ EOF
   elif [[ ,$acls, != *",$ACL,"* ]]; then
     incus network set "$BR" security.acls="$acls,$ACL"
   fi
-
-  # Anciennes versions : l'ACL était posée sur le bridge par défaut, on l'en retire
-  for n in $(incus network acl show "$ACL" | awk '/^used_by:/ {f=1; next} f && /^ *- / {sub(/.*\//, ""); print; next} {f=0}'); do
-    [[ $n == "$BR" ]] && continue
-    others=$(incus network get "$n" security.acls | tr ',' '\n' | { grep -vx "$ACL" || true; } | paste -sd, -)
-    if [[ -n $others ]]; then incus network set "$n" security.acls="$others"; else incus network unset "$n" security.acls; fi
-    warn "ACL $ACL retirée de $n (le builder a désormais son propre bridge $BR)."
-  done
 
   if ufw status 2>/dev/null | grep -q '^Status: active'; then
     info "UFW actif sur l'hôte : autorisation du bridge $BR"
@@ -356,12 +375,28 @@ step_container() {
   die "Pas de DNS dans le conteneur après 60 s. Tester sans l'ACL : incus network unset $BR security.acls"
 }
 
+# Anciennes versions : l'ACL était posée sur le bridge par défaut. Retirée seulement une fois le
+# conteneur déplacé, et jamais d'un réseau où une instance est encore attachée
+drop_old_acls() {
+  local n others
+  for n in $(incus network acl show "$ACL" | awk '/^used_by:/ {f=1; next} f && /^ *- / {sub(/.*\//, ""); print; next} {f=0}'); do
+    [[ $n == "$BR" ]] && continue
+    if incus network show "$n" | grep -q '^ *- /1.0/instances/'; then
+      warn "ACL $ACL laissée sur $n : des instances y sont encore attachées (incus network show $n)."
+      continue
+    fi
+    others=$(incus network get "$n" security.acls | tr ',' '\n' | { grep -vx "$ACL" || true; } | paste -sd, -)
+    if [[ -n $others ]]; then incus network set "$n" security.acls="$others"; else incus network unset "$n" security.acls; fi
+    warn "ACL $ACL retirée de $n (le builder a désormais son propre bridge $BR)."
+  done
+}
+
 # ---------------------------------------------------------------------------
 # Étapes conteneur
 # ---------------------------------------------------------------------------
 step_provision() {
   info "Docker et SSH dans $CT"
-  incus exec "$CT" --env COOLIFY_USER="$COOLIFY_USER" --env COOLIFY_KEY="$COOLIFY_KEY" -- bash -s <<'EOF'
+  incus exec "$CT" --env COOLIFY_USER="$COOLIFY_USER" --env COOLIFY_KEY="$COOLIFY_KEY" -- bash -s <<'EOF' 2>&1 | sanitize
 set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 apt-get update
@@ -459,7 +494,7 @@ step_netbird() {
   info "NetBird dans $CT"
   # Clé lue sur stdin : elle n'apparaît ni dans la liste des processus de l'hôte ni dans l'historique
   incus exec "$CT" --env NB_MANAGEMENT_URL="$NB_URL" --env NB_HOSTNAME="$CT" \
-    --env NB_COOLIFY_IP="$NB_COOLIFY_IP" --env NETBIRD_FPR="$NETBIRD_FPR" -- bash -c '
+    --env NB_COOLIFY_IP="$NB_COOLIFY_IP" --env NB_REGISTRY_PORTS="$NB_REGISTRY_PORTS" --env NETBIRD_FPR="$NETBIRD_FPR" -- bash -c '
     set -Eeuo pipefail
     export DEBIAN_FRONTEND=noninteractive
     read -r key
@@ -488,7 +523,7 @@ CONF
     systemctl is-enabled --quiet netbird 2>/dev/null || netbird service install
     systemctl is-active --quiet netbird || netbird service start
 
-    # Tunnel wt0 : entrée limitée au SSH de Coolify, sortie limitée à Coolify (conteneur et builds Docker)
+    # Tunnel wt0 : entrée limitée au SSH de Coolify, sortie limitée au registry de Coolify (conteneur et builds Docker)
     cat >/etc/builder-wt0.nft <<CONF
 table inet builder_wt0
 delete table inet builder_wt0
@@ -504,13 +539,13 @@ table inet builder_wt0 {
     type filter hook forward priority filter; policy accept;
     iifname "wt0" ct state established,related accept
     iifname "wt0" drop
-    oifname "wt0" ip daddr $NB_COOLIFY_IP accept
+    oifname "wt0" ip daddr $NB_COOLIFY_IP tcp dport { $NB_REGISTRY_PORTS } accept
     oifname "wt0" drop
   }
   chain output {
     type filter hook output priority filter; policy accept;
     oifname "wt0" ct state established,related accept
-    oifname "wt0" ip daddr $NB_COOLIFY_IP accept
+    oifname "wt0" ip daddr $NB_COOLIFY_IP tcp dport { $NB_REGISTRY_PORTS } accept
     oifname "wt0" drop
   }
 }
@@ -526,6 +561,8 @@ RemainAfterExit=yes
 ExecStart=/usr/sbin/nft -f /etc/builder-wt0.nft
 [Install]
 WantedBy=multi-user.target
+# Sans filtre chargé, NetBird ne démarre pas (pas de tunnel ouvert)
+RequiredBy=netbird.service
 CONF
     systemctl daemon-reload
     systemctl enable builder-wt0.service
@@ -533,8 +570,8 @@ CONF
 
     # Clé visible uniquement par netbird up, pas par apt ni ses scripts
     NB_SETUP_KEY=$key netbird up --management-url "$NB_MANAGEMENT_URL" --hostname "$NB_HOSTNAME"
-  ' <<<"$NB_KEY"
-  ct netbird status
+  ' <<<"$NB_KEY" 2>&1 | sanitize
+  ct netbird status 2>&1 | sanitize
 }
 
 # Valeurs lues dans le conteneur (moins fiable que l'hôte) : revalidées avant d'être
@@ -583,7 +620,9 @@ step_check() {
   done
 
   if ct docker run --rm hello-world &>/dev/null; then
-    ok "Docker fonctionne ($(ct docker info -f '{{.Driver}}'))"
+    drv=$(ct docker info -f '{{.Driver}}' 2>/dev/null || true)
+    [[ $drv =~ ^[a-z0-9_-]{1,32}$ ]] || drv=inconnu
+    ok "Docker fonctionne ($drv)"
   else
     ko "docker run hello-world échoue : incus exec $CT -- docker run --rm hello-world"
   fi
@@ -653,6 +692,7 @@ main() {
   step_incus
   step_network
   step_container
+  drop_old_acls
   step_provision
   (( NETBIRD )) && step_netbird
   step_check

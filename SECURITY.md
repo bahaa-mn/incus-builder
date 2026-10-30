@@ -9,10 +9,10 @@ Le code des builds (Dockerfile, dépendances téléchargées) est considéré co
 | Cible | Protection | Vérifiée par |
 |---|---|---|
 | L'hôte | conteneur non privilégié (root du conteneur = UID non root sur l'hôte) | `test.sh` |
-| Le réseau local | ACL `no-lan` : plages privées, multicast, broadcast et **toutes les adresses de l'hôte** rejetées | `test.sh`, `setup.sh check` |
+| Le réseau local | ACL `no-lan` : plages privées, multicast, broadcast, **toutes les adresses de l'hôte** et les réseaux connectés ou routés par l'hôte rejetés | `test.sh`, `setup.sh check` |
 | Les autres conteneurs de l'hôte | bridge dédié `builderbr0`, aucune autre instance dessus | `test.sh` |
-| Les autres pairs NetBird et les routes NetBird | filtre nftables sur `wt0` dans le conteneur : entrée limitée au SSH de Coolify, sortie limitée à Coolify | `test.sh`, `setup.sh check` |
-| Le shell root de l'opérateur | les valeurs lues dans le conteneur (utilisateur, IP NetBird) sont revalidées avant d'être affichées | relecture de code |
+| Les autres pairs NetBird, les routes NetBird et les autres services de Coolify | filtre nftables sur `wt0` dans le conteneur : entrée limitée au SSH de Coolify, sortie limitée au port du registry de Coolify ; NetBird ne démarre pas sans ce filtre | `test.sh`, `setup.sh check` |
+| Le shell root de l'opérateur | les valeurs lues dans le conteneur sont revalidées, et toute sortie du conteneur affichée est débarrassée des caractères de contrôle (setup.sh et test.sh) | relecture de code, harnais |
 
 Les paquets Incus (Zabbly) et NetBird viennent de leurs dépôts apt, avec une clé dont l'empreinte est inscrite dans le script.
 
@@ -24,7 +24,7 @@ Le script ne peut pas vérifier ces points : ils dépendent de comptes et de ré
 - [ ] supprimer la politique `Default` (tous vers tous), après avoir recréé vos autres accès
 - [ ] clé de setup à usage unique, expiration courte, qui n'attribue que le groupe `builder`
 - [ ] politique `coolify -> builder`, TCP 22, non bidirectionnelle
-- [ ] politique `builder -> coolify`, port du registry uniquement
+- [ ] politique `builder -> coolify`, port du registry uniquement (le même que celui donné au script)
 - [ ] aucune route réseau distribuée au groupe `builder`
 - [ ] depuis le conteneur, `netbird status -d` ne liste que Coolify
 
@@ -32,8 +32,8 @@ Le filtre `wt0` du conteneur bloque déjà les autres pairs. Les politiques NetB
 
 **Hôte**
 - [ ] durcir l'hôte lui-même (SSH, pare-feu, mises à jour) : voir [vps-setup](https://github.com/bahaa-mn/vps-setup)
-- [ ] après un changement d'adresse de l'hôte (nouvelle IP publique, nouvelle interface), relancer `sudo bash setup.sh` : l'ACL contient les adresses présentes lors de l'installation. `setup.sh check` signale une adresse joignable
-- [ ] si l'IP NetBird de Coolify change, relancer `sudo bash setup.sh netbird`
+- [ ] après un changement d'adresse ou de routes de l'hôte (nouvelle IP publique, nouvelle interface, nouveau VPN), relancer `sudo bash setup.sh` : l'ACL contient les adresses et les routes présentes lors de l'installation. `setup.sh check` signale une adresse de l'hôte joignable
+- [ ] si l'IP NetBird ou le port du registry de Coolify change, relancer `sudo bash setup.sh netbird`
 - [ ] ne pas ajouter d'utilisateur au groupe `incus-admin` sans raison : c'est un accès root à l'hôte
 - [ ] lancer `test.sh` depuis un dossier où vous seul pouvez écrire (le dossier personnel, pas `/tmp`)
 
@@ -51,6 +51,7 @@ Le filtre `wt0` du conteneur bloque déjà les autres pairs. Les politiques NetB
 ## Audits
 
 - Octobre 2026, premier passage (profil standard) : une faille confirmée (valeur du conteneur dans une commande à coller), corrigée ; cinq pistes vérifiées sur VM, corrigées.
+- Octobre 2026, second passage : correctifs du premier confirmés ; deux failles faibles (sorties du conteneur non filtrées dans le terminal, dans setup.sh et test.sh) et trois pistes (réseaux routés par l'hôte, ordre de retrait de l'ACL lors d'une mise à jour, tous les ports de Coolify joignables par le tunnel), toutes corrigées et testées sur VM.
 
 ## Signaler une faille
 

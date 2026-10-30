@@ -27,7 +27,7 @@ Le script pose ses questions au début, affiche un récapitulatif, fait tout, pu
 - nom du conteneur (`builder` par défaut)
 - nombre de CPU et mémoire (par défaut : tout sauf 1 CPU et 2 Go laissés à l'hôte)
 - nom de l'utilisateur Coolify (`coolify` par défaut) et sa clé publique, générée dans Coolify (optionnelle, ajoutable plus tard)
-- NetBird (optionnel) : URL du serveur, clé de setup (saisie masquée) et IP NetBird du serveur Coolify
+- NetBird (optionnel) : URL du serveur, clé de setup (saisie masquée), IP NetBird du serveur Coolify et port(s) de son registry (5000 par défaut)
 - ajout de l'utilisateur au groupe `incus-admin` (optionnel, équivalent root)
 - sur un laptop (batterie détectée) : pas de mise en veille, capot fermé compris
 
@@ -37,9 +37,9 @@ Le script pose ses questions au début, affiche un récapitulatif, fait tout, pu
 - installe Incus depuis le dépôt officiel [Zabbly](https://github.com/zabbly/incus) (empreinte de la clé vérifiée) : l'Incus 6.0.0 d'Ubuntu 24.04 ne fait plus tourner Docker depuis les correctifs de sécurité de runc (`open sysctl net.ipv4.ip_unprivileged_port_start ... permission denied`). Une version Ubuntu déjà installée est remplacée
 - l'initialise s'il ne l'est pas déjà (bridge par défaut `incusbr0` en `10.x.y.0/24` qui ne chevauche aucune route de l'hôte)
 - crée un bridge dédié au builder, `builderbr0`, en `10.x.y.0/24` libre et sans IPv6 : aucune autre instance ne le partage, et le bridge par défaut de l'hôte (et ses autres conteneurs) n'est pas modifié
-- pose l'ACL `no-lan` sur `builderbr0` : rejet de `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10` (NetBird, Tailscale), `169.254.0.0/16`, du multicast et du broadcast, **et de toutes les adresses IPv4 de l'hôte** (une IP publique de l'hôte serait sinon joignable), tout le reste autorisé vers internet. Incus laisse passer DHCP et DNS vers le bridge
+- pose l'ACL `no-lan` sur `builderbr0` : rejet de `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10` (NetBird, Tailscale), `169.254.0.0/16`, du multicast et du broadcast, **de toutes les adresses IPv4 de l'hôte** (une IP publique de l'hôte serait sinon joignable) **et des réseaux connectés ou routés par l'hôte** (LAN en adresses publiques, routes VPN ; les routes par la passerelle par défaut et celles plus larges que /8 restent ouvertes, c'est internet), tout le reste autorisé vers internet. Incus laisse passer DHCP et DNS vers le bridge
 - si UFW est actif : autorise le trafic du bridge (le filtrage reste fait par l'ACL)
-- si l'hôte change d'adresse (nouvelle IP publique), relancer le script pour mettre l'ACL à jour : `setup.sh check` teste toutes les adresses actuelles de l'hôte et signale celles qui seraient joignables
+- si l'hôte change d'adresse ou de routes (nouvelle IP publique, nouveau VPN), relancer le script pour mettre l'ACL à jour : `setup.sh check` teste toutes les adresses actuelles de l'hôte et signale celles qui seraient joignables
 
 **Conteneur** (Ubuntu 24.04)
 - `security.nesting` pour Docker, `/dev/net/tun` pour NetBird, limites CPU et mémoire, démarrage automatique
@@ -48,15 +48,16 @@ Le script pose ses questions au début, affiche un récapitulatif, fait tout, pu
 - utilisateur Coolify comme dans vps-setup ([doc non-root user](https://coolify.io/docs/core/infrastructure/servers/non-root-user)) : clé Coolify, sudo sans mot de passe, `/data/coolify`. Un compte déjà présent dans le conteneur (système, `ubuntu`) est refusé ; après un changement de nom, l'ancien compte est verrouillé et perd sudo
 - SSH par clé uniquement, root interdit, seul l'utilisateur Coolify autorisé (`AllowUsers`)
 - NetBird depuis son dépôt apt (empreinte de la clé vérifiée), `netbird up` avec l'URL et la clé de setup, hostname = nom du conteneur
-- filtre nftables sur le tunnel `wt0`, rechargé au démarrage : seul Coolify peut joindre le SSH du conteneur, et le conteneur comme ses builds Docker ne joignent que Coolify par le tunnel (les autres pairs et les routes NetBird sont bloqués)
+- filtre nftables sur le tunnel `wt0`, rechargé au démarrage (sans lui, NetBird ne démarre pas) : seul Coolify peut joindre le SSH du conteneur, et le conteneur comme ses builds Docker ne joignent que le registry de Coolify par le tunnel (autres ports, autres pairs et routes NetBird bloqués)
+- les sorties du conteneur affichées pendant le script (apt, Docker, NetBird) sont débarrassées des caractères de contrôle : un conteneur compromis ne peut pas réécrire l'affichage du terminal
 
-Relancer le script sur un conteneur existant le réutilise : limites, ACL et configuration sont réappliquées. Un conteneur installé par une version précédente (sur le bridge par défaut) est déplacé sur `builderbr0` et l'ACL est retirée du bridge par défaut.
+Relancer le script sur un conteneur existant le réutilise : limites, ACL et configuration sont réappliquées. Un conteneur installé par une version précédente (sur le bridge par défaut) est déplacé sur `builderbr0`, puis l'ACL est retirée du bridge par défaut, seulement s'il ne reste plus d'instance dessus.
 
 ## Étapes seules
 
 | Commande | Ce qu'elle fait |
 |---|---|
-| `sudo bash setup.sh netbird` | installe et connecte NetBird dans un conteneur existant (nouvelle clé de setup, autre serveur, nouvelle IP de Coolify) |
+| `sudo bash setup.sh netbird` | installe et connecte NetBird dans un conteneur existant (nouvelle clé de setup, autre serveur, nouvelle IP ou nouveau port de registry de Coolify) |
 | `sudo bash setup.sh check` | relance les vérifications |
 
 Vérifications : internet joignable, box injoignable depuis le conteneur, SSH de l'hôte injoignable depuis le conteneur, `docker run hello-world`, SSH actif, NetBird connecté, filtre `wt0` en place.
@@ -79,7 +80,7 @@ sudo bash test.sh [conteneur]
 
 Le test crée le temps de son exécution une interface factice, deux petits serveurs, une clé SSH et un utilisateur temporaires, et retire tout à la fin.
 
-Validé sur une VM Ubuntu 24.04 neuve (arm64), installation complète puis relance du script sur le conteneur existant : 50/50. Validé aussi en mise à jour depuis la version précédente, avec une adresse non privée sur l'hôte et un autre conteneur sur le bridge par défaut : 51/51, l'hôte et l'autre conteneur sont injoignables. Filtre `wt0` testé avec un faux tunnel et deux faux pairs : seul le pair Coolify passe, dans les deux sens, depuis le conteneur comme depuis Docker.
+Validé sur une VM Ubuntu 24.04 neuve (arm64), installation complète puis relance du script sur le conteneur existant : 50/50. Validé aussi en mise à jour depuis la version précédente, avec une adresse non privée sur l'hôte et un autre conteneur sur le bridge par défaut : 51/51, l'hôte et l'autre conteneur sont injoignables. Filtre `wt0` testé avec un faux tunnel et deux faux pairs : seul le registry du pair Coolify est joignable (depuis le conteneur comme depuis Docker), et seul Coolify joint le SSH du conteneur. Un sous-réseau 198.18.3.0/24 routé par l'hôte est bloqué.
 
 ## Après le script
 
@@ -88,7 +89,7 @@ La liste complète des vérifications à faire et des limites connues est dans [
 **NetBird**
 - supprimer la politique `Default` (tous vers tous) après avoir recréé vos accès homelab
 - politique `coolify -> builder`, TCP 22, non bidirectionnelle
-- politique `builder -> coolify`, port du registry
+- politique `builder -> coolify`, port du registry (le même que celui donné au script)
 - aucune route vers le LAN distribuée au groupe `builder`
 - vérification depuis le conteneur : `netbird status -d` ne doit lister que Coolify
 

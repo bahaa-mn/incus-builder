@@ -76,27 +76,29 @@ echo "== Hôte / LAN -> conteneur (entrée refusée)"
 expect_ko "hôte -> conteneur $CT_IP:22" tcp "$CT_IP" 22
 
 echo "== SSH du conteneur"
-U=$(ct awk '$1=="AllowUsers"{print $2}' /etc/ssh/sshd_config.d/00-hardening.conf)
+U=$(ct awk '$1=="AllowUsers"{print $2; exit}' /etc/ssh/sshd_config.d/00-hardening.conf)
+# Valeur lue dans le conteneur : validée avant tout affichage, comme dans setup.sh
+[[ $U =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "AllowUsers invalide dans le conteneur"; exit 1; }
 cfg=$(ct sshd -T)
 expect_ok "PermitRootLogin no" grep -qx 'permitrootlogin no' <<<"$cfg"
 expect_ok "PasswordAuthentication no" grep -qx 'passwordauthentication no' <<<"$cfg"
 expect_ok "AllowUsers $U" grep -qx "allowusers $U" <<<"$cfg"
 # Clé temporaire ajoutée à l'utilisateur Coolify, retirée à la fin
-ct rm -f /tmp/k /tmp/k.pub
-ct ssh-keygen -q -t ed25519 -N '' -C incus-builder-test -f /tmp/k
-ct bash -c "cat /tmp/k.pub >>/home/$U/.ssh/authorized_keys"
+ct rm -f /tmp/k /tmp/k.pub &>/dev/null
+ct ssh-keygen -q -t ed25519 -N '' -C incus-builder-test -f /tmp/k &>/dev/null
+ct bash -c "cat /tmp/k.pub >>/home/$U/.ssh/authorized_keys" &>/dev/null
 o='-o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i /tmp/k'
 expect_ok "clé Coolify : connexion $U + sudo root" ct bash -c "[[ \$(ssh $o $U@127.0.0.1 sudo -n whoami) == root ]]"
 expect_ok "$U : docker via sudo" ct ssh $o "$U@127.0.0.1" sudo -n docker ps
 expect_ok "$U : /data/coolify lui appartient" ct bash -c "[[ \$(stat -c %U /data/coolify) == $U ]]"
 expect_ko "root refusé avec la même clé" ct ssh $o root@127.0.0.1 true
-ct useradd -m intrus &>/dev/null; ct install -d -m 700 -o intrus /home/intrus/.ssh
-ct cp "/home/$U/.ssh/authorized_keys" /home/intrus/.ssh/; ct chown intrus /home/intrus/.ssh/authorized_keys
+ct useradd -m intrus &>/dev/null; ct install -d -m 700 -o intrus /home/intrus/.ssh &>/dev/null
+ct cp "/home/$U/.ssh/authorized_keys" /home/intrus/.ssh/ &>/dev/null; ct chown intrus /home/intrus/.ssh/authorized_keys &>/dev/null
 expect_ko "autre utilisateur refusé (AllowUsers)" ct ssh $o intrus@127.0.0.1 true
 ct userdel -r intrus &>/dev/null
 expect_ko "mot de passe refusé" ct ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o PubkeyAuthentication=no -o ConnectTimeout=5 "$U@127.0.0.1" true
-ct sed -i '/ incus-builder-test$/d' "/home/$U/.ssh/authorized_keys"
-ct rm -f /tmp/k /tmp/k.pub
+ct sed -i '/ incus-builder-test$/d' "/home/$U/.ssh/authorized_keys" &>/dev/null
+ct rm -f /tmp/k /tmp/k.pub &>/dev/null
 
 echo "== Prérequis NetBird dans le conteneur"
 expect_ok "/dev/net/tun présent" ct test -c /dev/net/tun
