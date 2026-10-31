@@ -30,7 +30,7 @@ Le script pose ses questions au début, affiche un récapitulatif, fait tout, pu
 - nom du conteneur (`builder` par défaut)
 - nombre de CPU et mémoire (par défaut : tout sauf 1 CPU et 2 Go laissés à l'hôte)
 - nom de l'utilisateur Coolify (`coolify` par défaut) et sa clé publique, générée dans Coolify (optionnelle, ajoutable plus tard)
-- NetBird (optionnel) : URL du serveur, clé de setup (saisie masquée), IP NetBird du serveur Coolify et port(s) de son registry (5000 par défaut)
+- NetBird (optionnel) : URL du serveur, clé de setup (saisie masquée), IP NetBird du serveur Coolify et port(s) de son registry (5000 par défaut, utile seulement si le registry est joint par NetBird, voir [Registry](#registry))
 - ajout de l'utilisateur au groupe `incus-admin` (optionnel, équivalent root)
 - sur un laptop (batterie détectée) : pas de mise en veille, capot fermé compris
 
@@ -63,7 +63,7 @@ Relancer le script sur un conteneur existant le réutilise : limites, ACL et con
 | `sudo bash setup.sh netbird` | installe et connecte NetBird dans un conteneur existant (nouvelle clé de setup, autre serveur, nouvelle IP ou nouveau port de registry de Coolify) |
 | `sudo bash setup.sh check` | relance les vérifications |
 
-Vérifications : internet joignable, box injoignable depuis le conteneur, SSH de l'hôte injoignable depuis le conteneur, `docker run hello-world`, SSH actif, NetBird connecté, filtre `wt0` en place.
+Vérifications : internet joignable, box injoignable depuis le conteneur, SSH de l'hôte injoignable depuis le conteneur, `docker run hello-world`, SSH actif, NetBird connecté, filtre `wt0` en place, IP de Coolify du filtre présente parmi les pairs NetBird (sinon l'IP de Coolify a changé : SSH et registry sont bloqués).
 
 ## Tests complets
 
@@ -93,11 +93,27 @@ La liste complète des vérifications à faire et des limites connues est dans [
 **NetBird**
 - supprimer la politique `Default` (tous vers tous) après avoir recréé vos accès homelab
 - politique `coolify -> builder`, TCP 22, non bidirectionnelle
-- politique `builder -> coolify`, port du registry (le même que celui donné au script)
+- politique `builder -> coolify`, port du registry (le même que celui donné au script), seulement si le registry est joint par NetBird
 - aucune route vers le LAN distribuée au groupe `builder`
 - vérification depuis le conteneur : `netbird status -d` ne doit lister que Coolify
 
-**Coolify** : Servers > Add, IP NetBird du conteneur, port 22, utilisateur `coolify`, clé générée dans Coolify, cocher "Use it as a build server". Dans chaque application : ce build server et une image dans le registry.
+**Coolify** : Servers > Add, IP NetBird du conteneur, port 22, utilisateur `coolify`, clé générée dans Coolify, cocher "Use it as a build server". Dans chaque application : Builder selection = ce build server, Image = `registry.example.com/projet/app` (un `/`, pas de `:` qui désigne le tag), Tag vide (Coolify tague avec le commit, ce qui garde les rollbacks).
+
+### Registry
+
+Coolify utilise le même nom d'image pour le push (depuis le builder) et le pull (depuis le serveur de déploiement) : les deux doivent joindre la même adresse.
+
+- **Registry public en HTTPS** (avec mot de passe), dès qu'un serveur de déploiement n'est pas sur NetBird. Le builder le joint par internet, l'ACL le permet. Pas de politique `builder -> coolify`. Derrière Cloudflare, proxy désactivé (nuage gris) : il limite les requêtes à 100 Mo et casse le push des grosses couches.
+- **Registry joint par NetBird**, en HTTP sur l'IP NetBird de Coolify, seulement si tous les serveurs de déploiement sont sur NetBird : politique `builder -> coolify` sur son port (et une politique pour chaque serveur de déploiement), `"insecure-registries": ["IP:port"]` dans `/etc/docker/daemon.json` du builder et de chaque serveur, et sur le serveur du registry, le port publié sur l'IP NetBird seulement (Docker contourne UFW) avec UFW ouvert sur `wt0` (`ufw allow in on wt0 ...` et `ufw route allow in on wt0 ...`).
+
+Connexion au registry : Coolify lit `~/.docker/config.json` de son utilisateur SSH. Un `sudo docker login` enregistre pour root et ne sert pas aux builds (erreur `Docker config file ... of the SSH user (coolify) not found`) :
+
+```bash
+sudo incus exec builder -- docker --config /home/coolify/.docker login registry.example.com -u UTILISATEUR
+sudo incus exec builder -- chown -R coolify:coolify /home/coolify/.docker
+```
+
+Même chose sur chaque serveur de déploiement, avec l'utilisateur SSH que Coolify y utilise.
 
 ## Commandes utiles
 

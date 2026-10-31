@@ -596,7 +596,7 @@ netbird_ip() {
 # ---------------------------------------------------------------------------
 step_check() {
   info "Vérifications"
-  local gw addr nb cu
+  local gw addr nb cu fip
   FAILED=0
   BR=$(network_of_ct)
   gw=$(ip -4 route show default | awk '{print $3; exit}')
@@ -639,6 +639,15 @@ step_check() {
     nb=$(netbird_ip)
     if ct netbird status | grep -q 'Management: Connected'; then ok "NetBird connecté (${nb:-IP inconnue})"; else ko "NetBird non connecté : incus exec $CT -- netbird status"; fi
     if ct nft list table inet builder_wt0 &>/dev/null; then ok "Filtre du tunnel wt0 en place"; else ko "Filtre wt0 absent : sudo bash setup.sh netbird"; fi
+    # Le filtre garde l'IP de Coolify de l'installation : si elle change, SSH et registry sont bloqués sans autre signe
+    fip=$(ct nft list table inet builder_wt0 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "saddr") {print $(i + 1); exit}}' || true)
+    if ! valid_ipv4 "$fip"; then
+      ko "IP de Coolify introuvable dans le filtre wt0 : sudo bash setup.sh netbird"
+    elif ct netbird status -d 2>/dev/null | grep -qE "^ *NetBird IP: ${fip//./\\.}\$"; then
+      ok "Filtre wt0 : Coolify ($fip) est un pair NetBird"
+    else
+      ko "Filtre wt0 : $fip n'est pas un pair NetBird (IP de Coolify changée ou politique coolify -> builder absente) : sudo bash setup.sh netbird"
+    fi
   fi
   return 0
 }
@@ -653,7 +662,7 @@ summary() {
   echo "Dans NetBird :"
   echo "  - supprimer la politique Default (tous vers tous), sinon le builder joint tous les pairs"
   echo "  - politique coolify -> builder, TCP 22, non bidirectionnelle"
-  echo "  - politique builder -> coolify, port du registry"
+  echo "  - politique builder -> coolify, port du registry (seulement si le registry est joint par NetBird)"
   echo "  - aucune route vers le LAN distribuée au groupe builder"
   echo
   echo "Dans Coolify : Servers > Add"
